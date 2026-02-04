@@ -68,10 +68,30 @@ func toolWrite(args map[string]interface{}) (string, error) {
 		return "", fmt.Errorf("content must be a string")
 	}
 
+	if !strings.HasPrefix(path, "/") {
+		if strings.HasPrefix(path, "./") {
+			path = strings.TrimLeft(path, "./")
+		}
+
+		cwd, err := os.Getwd()
+		if err != nil {
+			return "", fmt.Errorf("cannot get current working directory")
+		}
+
+		path = fmt.Sprintf("%s/%s", cwd, path)
+	}
+
+	// Create parent directories if they don't exist
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", fmt.Errorf("failed to create directories: %w", err)
+	}
+
 	err := os.WriteFile(path, []byte(content), 0o644)
 	if err != nil {
 		return "", err
 	}
+	fmt.Printf("writing file to %s\n", path)
 
 	return "ok", nil
 }

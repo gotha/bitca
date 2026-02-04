@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
+	"os"
 	"regexp"
 	"strings"
 
@@ -11,8 +13,19 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/gotha/bitca/mcp"
 	"github.com/ollama/ollama/api"
 )
+
+var debugLog *log.Logger
+
+func init() {
+	f, err := os.OpenFile("debug.log", os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+	if err != nil {
+		log.Fatalf("error opening debug log file: %v", err)
+	}
+	debugLog = log.New(f, "", log.LstdFlags)
+}
 
 var (
 	// Color palette
@@ -52,6 +65,16 @@ var (
 			Bold(true).
 			MarginTop(1)
 
+	commandStyle = lipgloss.NewStyle().
+			Foreground(accentColor).
+			Bold(true).
+			MarginTop(1)
+
+	systemStyle = lipgloss.NewStyle().
+			Foreground(secondaryColor).
+			Bold(true).
+			MarginTop(1)
+
 	inputBoxStyle = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(borderColor).
@@ -80,6 +103,9 @@ type model struct {
 	conversation    []string
 	client          *api.Client
 	tools           api.Tools
+	mcpManager      *mcp.Manager
+	commandRegistry *CommandRegistry
+	modelName       string
 	waiting         bool
 	streaming       bool
 	currentResponse string
@@ -95,9 +121,9 @@ type streamChunkMsg struct {
 }
 
 type streamDoneMsg struct {
-	fullContent    string
-	assistantMsg   api.Message
-	err            error
+	fullContent  string
+	assistantMsg api.Message
+	err          error
 }
 
 type toolExecutionMsg struct {
@@ -124,24 +150,41 @@ func initialModel() (model, error) {
 	vp := viewport.New(80, 20)
 	vp.SetContent("")
 
-	// Define tools
+	// Define built-in tools
 	tools := defineTools()
 
-	// Add system prompt to guide tool usage
+	// Load MCP tools
+	mcpManager := mcp.NewManager()
+	if err := mcpManager.LoadFromConfig(mcp.DefaultConfigPath()); err != nil {
+		// Log warning but continue without MCP tools
+		fmt.Printf("Warning: failed to load MCP config: %v\n", err)
+	}
+
+	// Merge MCP tools with built-in tools
+	mcpTools := mcpManager.GetOllamaTools()
+	tools = append(tools, mcpTools...)
+
+	// Build a concise system prompt - don't list all tools, let the model discover them
 	systemPrompt := api.Message{
 		Role: "system",
-		Content: `You are a helpful AI assistant. Answer questions naturally and conversationally.
+		Content: `You are a helpful AI assistant with access to tools.
 
-You have access to these tools for file operations and system commands:
-- read: Read file contents
-- write: Write to a file
-- edit: Replace text in a file
-- glob: Find files by pattern
-- grep: Search files with regex
-- bash: Run shell commands
+CRITICAL INSTRUCTION: You MUST call tools when asked to perform actions. Do NOT describe or explain tools - USE them by making function calls.
 
-Use tools when needed for file operations or running commands. For general knowledge questions, just answer directly and naturally.`,
+When the user asks you to do something, call the appropriate tool immediately. Examples:
+- "What is my GitHub username?" -> Call the get_me tool
+- "Read a file" -> Call the read tool
+- "Run a command" -> Call the bash tool
+- "Show git status" -> Call the git_status tool
+
+Never explain how to use a tool. Just call it.`,
 	}
+
+	// Create command registry
+	commandRegistry := NewCommandRegistry()
+
+	// Use model from command-line config
+	modelName := config.Model
 
 	return model{
 		viewport:        vp,
@@ -150,6 +193,9 @@ Use tools when needed for file operations or running commands. For general knowl
 		conversation:    []string{},
 		client:          client,
 		tools:           tools,
+		mcpManager:      mcpManager,
+		commandRegistry: commandRegistry,
+		modelName:       modelName,
 		waiting:         false,
 		streaming:       false,
 		currentResponse: "",
@@ -167,6 +213,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds []tea.Cmd
 	)
 
+	// Handle nil messages (from closed channels)
+	if msg == nil {
+		return m, nil
+	}
+
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
@@ -175,7 +226,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if !m.ready {
 			// Initialize viewport with proper size
 			// Account for borders, padding, and input area
-			viewportWidth := msg.Width - 8  // Account for viewport border and padding
+			viewportWidth := msg.Width - 8    // Account for viewport border and padding
 			viewportHeight := msg.Height - 10 // Account for viewport, input, and help text
 			m.viewport = viewport.New(viewportWidth, viewportHeight)
 			m.viewport.YPosition = 0
@@ -198,6 +249,42 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			userInput := strings.TrimSpace(m.textInput.Value())
 			if userInput == "" {
+				return m, nil
+			}
+
+			// Check if input is a slash command
+			if m.commandRegistry != nil && m.commandRegistry.IsCommand(userInput) {
+				// Handle /model command specially to update model
+				cmdName, cmdArgs := ParseCommand(userInput)
+				if strings.ToLower(cmdName) == "model" && len(cmdArgs) > 0 {
+					newModel := cmdArgs[0]
+					m.modelName = newModel
+					m.conversation = append(m.conversation, fmt.Sprintf("Command: %s", userInput))
+					m.conversation = append(m.conversation, fmt.Sprintf("System: Model changed to: %s", newModel))
+					m.textInput.SetValue("")
+					m.updateViewportContent()
+					return m, nil
+				}
+
+				// Execute the command
+				ctx := CommandContext{
+					MCPManager:   m.mcpManager,
+					Tools:        m.tools,
+					CurrentModel: m.modelName,
+				}
+
+				// Show the command in conversation
+				m.conversation = append(m.conversation, fmt.Sprintf("Command: %s", userInput))
+				m.textInput.SetValue("")
+
+				output, err := m.commandRegistry.Execute(userInput, ctx)
+				if err != nil {
+					m.conversation = append(m.conversation, fmt.Sprintf("Error: %s", err.Error()))
+				} else {
+					m.conversation = append(m.conversation, fmt.Sprintf("System: %s", output))
+				}
+
+				m.updateViewportContent()
 				return m, nil
 			}
 
@@ -226,12 +313,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Accumulate streaming chunks
 		m.currentResponse += msg.content
 		m.updateViewportContent()
-		// Continue waiting for more chunks
-		return m, waitForStreamChunk(m.streamChan)
+		// Continue waiting for more chunks only if channel is still valid
+		if m.streamChan != nil {
+			return m, waitForStreamChunk(m.streamChan)
+		}
+		return m, nil
 
 	case streamDoneMsg:
 		m.waiting = false
 		m.streaming = false
+		m.streamChan = nil // Clear the channel to prevent stale reads
 		if msg.err != nil {
 			m.err = msg.err
 			m.conversation = append(m.conversation, fmt.Sprintf("Error: %s", msg.err))
@@ -347,6 +438,18 @@ func (m *model) updateViewportContent() {
 			wrapped := wordWrap(content, m.viewport.Width-4)
 			styledContent := messageContentStyle.Render(wrapped)
 			b.WriteString(label + "\n" + styledContent)
+		} else if strings.HasPrefix(line, "Command: ") {
+			content := strings.TrimPrefix(line, "Command: ")
+			label := commandStyle.Render("Command:")
+			wrapped := wordWrap(content, m.viewport.Width-4)
+			styledContent := messageContentStyle.Render(wrapped)
+			b.WriteString(label + "\n" + styledContent)
+		} else if strings.HasPrefix(line, "System: ") {
+			content := strings.TrimPrefix(line, "System: ")
+			label := systemStyle.Render("System:")
+			wrapped := wordWrap(content, m.viewport.Width-4)
+			styledContent := messageContentStyle.Render(wrapped)
+			b.WriteString(label + "\n" + styledContent)
 		} else {
 			wrapped := wordWrap(line, m.viewport.Width-4)
 			b.WriteString(wrapped)
@@ -421,13 +524,50 @@ func (m model) View() string {
 
 func (m model) sendMessage() tea.Cmd {
 	// Messages array already contains the full conversation context
-	stream := true
+	// Streaming is enabled by default, but can be disabled via --no-streaming flag
+	// Some models don't return tool calls with streaming enabled
+	stream := !config.NoStreaming
 	req := &api.ChatRequest{
-		Model:    "llama3.1:8b",
+		Model:    m.modelName,
 		Messages: m.messages, // This includes all previous messages for context
 		Tools:    m.tools,    // Include tool definitions
 		Stream:   &stream,
 	}
+
+	// Debug: log the request
+	debugLog.Printf("=== Sending request to Ollama ===")
+	debugLog.Printf("Model: %s", m.modelName)
+	debugLog.Printf("Streaming: %v", stream)
+	debugLog.Printf("Number of tools: %d", len(m.tools))
+	// Log all tool names to help debug
+	for i, tool := range m.tools {
+		debugLog.Printf("  Tool %d: %s", i, tool.Function.Name)
+	}
+	// Log detailed structure of get_me tool (if present)
+	for _, tool := range m.tools {
+		if tool.Function.Name == "get_me" {
+			debugLog.Printf("=== get_me tool details ===")
+			debugLog.Printf("  Name: %s", tool.Function.Name)
+			debugLog.Printf("  Description: %s", tool.Function.Description)
+			debugLog.Printf("  Parameters Type: %s", tool.Function.Parameters.Type)
+			debugLog.Printf("  Parameters Required: %v", tool.Function.Parameters.Required)
+			// Iterate over properties map
+			debugLog.Printf("  Properties:")
+			if tool.Function.Parameters.Properties != nil {
+				propsMap := tool.Function.Parameters.Properties.ToMap()
+				debugLog.Printf("    Properties count: %d", len(propsMap))
+				for k, v := range propsMap {
+					debugLog.Printf("    %s: type=%v, desc=%s", k, v.Type, v.Description)
+				}
+			} else {
+				debugLog.Printf("    (nil)")
+			}
+			// Log the full JSON of the tool
+			toolJSON, _ := json.MarshalIndent(tool, "", "  ")
+			debugLog.Printf("  Full JSON:\n%s", string(toolJSON))
+		}
+	}
+	debugLog.Printf("Number of messages: %d", len(m.messages))
 
 	// Return a command that will stream responses
 	return func() tea.Msg {
@@ -440,6 +580,8 @@ func (m model) sendMessage() tea.Cmd {
 			var toolCalls []api.ToolCall
 
 			err := m.client.Chat(ctx, req, func(resp api.ChatResponse) error {
+				debugLog.Printf("Response callback - Content len: %d, ToolCalls: %d", len(resp.Message.Content), len(resp.Message.ToolCalls))
+
 				if resp.Message.Content != "" {
 					fullContent.WriteString(resp.Message.Content)
 					// Send chunk update
@@ -448,6 +590,10 @@ func (m model) sendMessage() tea.Cmd {
 
 				// Capture tool calls from the response
 				if len(resp.Message.ToolCalls) > 0 {
+					debugLog.Printf("Received tool calls: %d", len(resp.Message.ToolCalls))
+					for _, tc := range resp.Message.ToolCalls {
+						debugLog.Printf("  Tool call: %s with args: %v", tc.Function.Name, tc.Function.Arguments)
+					}
 					toolCalls = resp.Message.ToolCalls
 				}
 
@@ -478,7 +624,6 @@ func (m model) sendMessage() tea.Cmd {
 	}
 }
 
-
 // executeTools runs the requested tool calls and returns their results
 func (m model) executeTools(toolCalls []api.ToolCall) tea.Cmd {
 	return func() tea.Msg {
@@ -487,17 +632,27 @@ func (m model) executeTools(toolCalls []api.ToolCall) tea.Cmd {
 		for _, toolCall := range toolCalls {
 			// Get arguments as map
 			args := toolCall.Function.Arguments.ToMap()
+			toolName := toolCall.Function.Name
 
 			// Log tool execution for debugging
-			toolInfo := fmt.Sprintf("Executing tool: %s with args: %v", toolCall.Function.Name, args)
+			toolInfo := fmt.Sprintf("Executing tool: %s with args: %v", toolName, args)
 
-			// Execute the tool
-			result, err := executeTool(toolCall.Function.Name, args)
+			var result string
+			var err error
+
+			// Check if this is an MCP tool
+			if m.mcpManager != nil && m.mcpManager.HasTool(toolName) {
+				result, err = m.mcpManager.ExecuteTool(toolName, args)
+			} else {
+				// Execute built-in tool
+				result, err = executeTool(toolName, args)
+			}
+
 			if err != nil {
 				// Create tool response message with error
 				results = append(results, api.Message{
 					Role:       "tool",
-					Content:    fmt.Sprintf("Error executing %s: %v\nDebug: %s", toolCall.Function.Name, err, toolInfo),
+					Content:    fmt.Sprintf("Error executing %s: %v\nDebug: %s", toolName, err, toolInfo),
 					ToolCallID: toolCall.ID, // Link back to the tool call
 				})
 				continue
@@ -515,7 +670,6 @@ func (m model) executeTools(toolCalls []api.ToolCall) tea.Cmd {
 	}
 }
 
-
 // waitForStreamChunk waits for the next streaming chunk
 func waitForStreamChunk(msgChan <-chan tea.Msg) tea.Cmd {
 	return func() tea.Msg {
@@ -526,7 +680,6 @@ func waitForStreamChunk(msgChan <-chan tea.Msg) tea.Cmd {
 		return msg
 	}
 }
-
 
 // parseJSONToolCalls extracts tool calls from JSON in the response text
 // Looks for patterns like: {"name": "tool_name", "parameters": {...}}

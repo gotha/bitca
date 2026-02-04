@@ -22,6 +22,7 @@
             gopkgs
             godef
             golint
+            just
           ];
 
           shellHook = ''
