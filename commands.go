@@ -5,16 +5,17 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/gotha/bitca/backend"
 	"github.com/gotha/bitca/mcp"
-	"github.com/ollama/ollama/api"
 )
 
 // CommandContext provides context for command execution
 type CommandContext struct {
-	MCPManager   *mcp.Manager
-	Tools        api.Tools
-	CurrentModel string
-	SetModel     func(string) // callback to change the model
+	MCPManager     *mcp.Manager
+	Tools          []backend.Tool
+	CurrentModel   string
+	CurrentBackend string
+	SetModel       func(string) // callback to change the model
 }
 
 // CommandHandler is the function signature for command handlers
@@ -67,6 +68,12 @@ func NewCommandRegistry() *CommandRegistry {
 		Name:        "debug",
 		Description: "Show debug information about the current state",
 		Handler:     cmdDebug,
+	})
+
+	registry.Register(Command{
+		Name:        "backend",
+		Description: "Show current backend information",
+		Handler:     cmdBackend,
 	})
 
 	return registry
@@ -216,8 +223,8 @@ func cmdTools(ctx CommandContext, args []string) (string, error) {
 	}
 
 	for _, tool := range ctx.Tools {
-		name := tool.Function.Name
-		desc := tool.Function.Description
+		name := tool.Name
+		desc := tool.Description
 
 		if builtInNames[name] {
 			builtInTools = append(builtInTools, fmt.Sprintf("  • %s: %s", name, desc))
@@ -315,7 +322,7 @@ func cmdDebug(ctx CommandContext, args []string) (string, error) {
 	}
 
 	for _, tool := range ctx.Tools {
-		if builtInNames[tool.Function.Name] {
+		if builtInNames[tool.Name] {
 			builtInCount++
 		} else {
 			mcpCount++
@@ -336,5 +343,17 @@ func cmdDebug(ctx CommandContext, args []string) (string, error) {
 		b.WriteString("\nMCP Manager: not initialized\n")
 	}
 
+	return b.String(), nil
+}
+
+
+// cmdBackend handles the /backend command
+func cmdBackend(ctx CommandContext, args []string) (string, error) {
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("Current Backend: %s\n", ctx.CurrentBackend))
+	b.WriteString(fmt.Sprintf("Current Model: %s\n", ctx.CurrentModel))
+	b.WriteString("\nNote: To switch backends, restart the application with:\n")
+	b.WriteString("  -backend ollama   (default, local Ollama)\n")
+	b.WriteString("  -backend openai   (requires OPENAI_API_KEY)\n")
 	return b.String(), nil
 }

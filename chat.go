@@ -13,8 +13,8 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/gotha/bitca/backend"
 	"github.com/gotha/bitca/mcp"
-	"github.com/ollama/ollama/api"
 )
 
 var debugLog *log.Logger
@@ -99,10 +99,10 @@ var (
 type model struct {
 	viewport        viewport.Model
 	textInput       textinput.Model
-	messages        []api.Message
+	messages        []backend.Message
 	conversation    []string
-	client          *api.Client
-	tools           api.Tools
+	backend         backend.Backend
+	tools           []backend.Tool
 	mcpManager      *mcp.Manager
 	commandRegistry *CommandRegistry
 	modelName       string
@@ -122,16 +122,27 @@ type streamChunkMsg struct {
 
 type streamDoneMsg struct {
 	fullContent  string
-	assistantMsg api.Message
+	toolCalls    []backend.ToolCall
 	err          error
 }
 
 type toolExecutionMsg struct {
-	results []api.Message
+	results []backend.Message
 }
 
 func initialModel() (model, error) {
-	client, err := api.ClientFromEnvironment()
+	// Create backend based on configuration
+	var llmBackend backend.Backend
+	var err error
+	var modelName string
+
+	if config.Backend == "openai" {
+		llmBackend, err = backend.NewOpenAIBackend(config.OpenAIAPIKey, config.OpenAIAPIBase)
+		modelName = config.OpenAIModel
+	} else {
+		llmBackend, err = backend.NewOllamaBackend()
+		modelName = config.Model
+	}
 	if err != nil {
 		return model{}, err
 	}
@@ -150,8 +161,8 @@ func initialModel() (model, error) {
 	vp := viewport.New(80, 20)
 	vp.SetContent("")
 
-	// Define built-in tools
-	tools := defineTools()
+	// Define built-in tools (convert to backend.Tool format)
+	tools := convertBuiltInTools()
 
 	// Load MCP tools
 	mcpManager := mcp.NewManager()
@@ -161,11 +172,11 @@ func initialModel() (model, error) {
 	}
 
 	// Merge MCP tools with built-in tools
-	mcpTools := mcpManager.GetOllamaTools()
+	mcpTools := mcpManager.GetBackendTools()
 	tools = append(tools, mcpTools...)
 
-	// Build a concise system prompt - don't list all tools, let the model discover them
-	systemPrompt := api.Message{
+	// Build a concise system prompt
+	systemPrompt := backend.Message{
 		Role: "system",
 		Content: `You are a helpful AI assistant with access to tools.
 
@@ -183,15 +194,12 @@ Never explain how to use a tool. Just call it.`,
 	// Create command registry
 	commandRegistry := NewCommandRegistry()
 
-	// Use model from command-line config
-	modelName := config.Model
-
 	return model{
 		viewport:        vp,
 		textInput:       ti,
-		messages:        []api.Message{systemPrompt},
+		messages:        []backend.Message{systemPrompt},
 		conversation:    []string{},
-		client:          client,
+		backend:         llmBackend,
 		tools:           tools,
 		mcpManager:      mcpManager,
 		commandRegistry: commandRegistry,
@@ -268,9 +276,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 				// Execute the command
 				ctx := CommandContext{
-					MCPManager:   m.mcpManager,
-					Tools:        m.tools,
-					CurrentModel: m.modelName,
+					MCPManager:     m.mcpManager,
+					Tools:          m.tools,
+					CurrentModel:   m.modelName,
+					CurrentBackend: m.backend.Name(),
 				}
 
 				// Show the command in conversation
@@ -288,8 +297,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 
-			// Add user message to messages array (for Ollama context)
-			userMsg := api.Message{Role: "user", Content: userInput}
+			// Add user message to messages array
+			userMsg := backend.Message{Role: "user", Content: userInput}
 			m.messages = append(m.messages, userMsg)
 
 			// Add user message to conversation display
@@ -331,11 +340,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
-		// Add assistant message to messages array (for Ollama context)
-		m.messages = append(m.messages, msg.assistantMsg)
+		// Add assistant message to messages array
+		assistantMsg := backend.Message{
+			Role:    "assistant",
+			Content: msg.fullContent,
+		}
+		// Convert tool calls to backend format
+		if len(msg.toolCalls) > 0 {
+			assistantMsg.ToolCalls = msg.toolCalls
+		}
+		m.messages = append(m.messages, assistantMsg)
 
-		// Check if there are tool calls to execute (from API)
-		toolCalls := msg.assistantMsg.ToolCalls
+		// Check if there are tool calls to execute
+		toolCalls := msg.toolCalls
 
 		// If no API tool calls, check if the response contains JSON tool calls
 		if len(toolCalls) == 0 && msg.fullContent != "" {
@@ -353,8 +370,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			// Show which tools are being called
 			for _, tc := range toolCalls {
-				args := tc.Function.Arguments.ToMap()
-				m.conversation = append(m.conversation, fmt.Sprintf("[Calling tool: %s with args: %v]", tc.Function.Name, args))
+				m.conversation = append(m.conversation, fmt.Sprintf("[Calling tool: %s with args: %v]", tc.Name, tc.Arguments))
 			}
 
 			m.updateViewportContent()
@@ -523,49 +539,17 @@ func (m model) View() string {
 }
 
 func (m model) sendMessage() tea.Cmd {
-	// Messages array already contains the full conversation context
 	// Streaming is enabled by default, but can be disabled via --no-streaming flag
 	// Some models don't return tool calls with streaming enabled
 	stream := !config.NoStreaming
-	req := &api.ChatRequest{
-		Model:    m.modelName,
-		Messages: m.messages, // This includes all previous messages for context
-		Tools:    m.tools,    // Include tool definitions
-		Stream:   &stream,
-	}
 
 	// Debug: log the request
-	debugLog.Printf("=== Sending request to Ollama ===")
+	debugLog.Printf("=== Sending request to %s ===", m.backend.Name())
 	debugLog.Printf("Model: %s", m.modelName)
 	debugLog.Printf("Streaming: %v", stream)
 	debugLog.Printf("Number of tools: %d", len(m.tools))
-	// Log all tool names to help debug
 	for i, tool := range m.tools {
-		debugLog.Printf("  Tool %d: %s", i, tool.Function.Name)
-	}
-	// Log detailed structure of get_me tool (if present)
-	for _, tool := range m.tools {
-		if tool.Function.Name == "get_me" {
-			debugLog.Printf("=== get_me tool details ===")
-			debugLog.Printf("  Name: %s", tool.Function.Name)
-			debugLog.Printf("  Description: %s", tool.Function.Description)
-			debugLog.Printf("  Parameters Type: %s", tool.Function.Parameters.Type)
-			debugLog.Printf("  Parameters Required: %v", tool.Function.Parameters.Required)
-			// Iterate over properties map
-			debugLog.Printf("  Properties:")
-			if tool.Function.Parameters.Properties != nil {
-				propsMap := tool.Function.Parameters.Properties.ToMap()
-				debugLog.Printf("    Properties count: %d", len(propsMap))
-				for k, v := range propsMap {
-					debugLog.Printf("    %s: type=%v, desc=%s", k, v.Type, v.Description)
-				}
-			} else {
-				debugLog.Printf("    (nil)")
-			}
-			// Log the full JSON of the tool
-			toolJSON, _ := json.MarshalIndent(tool, "", "  ")
-			debugLog.Printf("  Full JSON:\n%s", string(toolJSON))
-		}
+		debugLog.Printf("  Tool %d: %s", i, tool.Name)
 	}
 	debugLog.Printf("Number of messages: %d", len(m.messages))
 
@@ -577,24 +561,25 @@ func (m model) sendMessage() tea.Cmd {
 			defer close(m.streamChan)
 
 			var fullContent strings.Builder
-			var toolCalls []api.ToolCall
+			var toolCalls []backend.ToolCall
 
-			err := m.client.Chat(ctx, req, func(resp api.ChatResponse) error {
-				debugLog.Printf("Response callback - Content len: %d, ToolCalls: %d", len(resp.Message.Content), len(resp.Message.ToolCalls))
+			err := m.backend.Chat(ctx, m.modelName, m.messages, m.tools, stream, func(chunk backend.StreamChunk) error {
+				debugLog.Printf("Response callback - Content len: %d, Done: %v, ToolCalls: %d",
+					len(chunk.Content), chunk.Done, len(chunk.ToolCalls))
 
-				if resp.Message.Content != "" {
-					fullContent.WriteString(resp.Message.Content)
+				if chunk.Content != "" {
+					fullContent.WriteString(chunk.Content)
 					// Send chunk update
-					m.streamChan <- streamChunkMsg{content: resp.Message.Content}
+					m.streamChan <- streamChunkMsg{content: chunk.Content}
 				}
 
 				// Capture tool calls from the response
-				if len(resp.Message.ToolCalls) > 0 {
-					debugLog.Printf("Received tool calls: %d", len(resp.Message.ToolCalls))
-					for _, tc := range resp.Message.ToolCalls {
-						debugLog.Printf("  Tool call: %s with args: %v", tc.Function.Name, tc.Function.Arguments)
+				if len(chunk.ToolCalls) > 0 {
+					debugLog.Printf("Received tool calls: %d", len(chunk.ToolCalls))
+					for _, tc := range chunk.ToolCalls {
+						debugLog.Printf("  Tool call: %s with args: %v", tc.Name, tc.Arguments)
 					}
-					toolCalls = resp.Message.ToolCalls
+					toolCalls = chunk.ToolCalls
 				}
 
 				return nil
@@ -604,18 +589,10 @@ func (m model) sendMessage() tea.Cmd {
 				return
 			}
 
-			// Create assistant message with the complete response
-			content := fullContent.String()
-			assistantMsg := api.Message{
-				Role:      "assistant",
-				Content:   content,
-				ToolCalls: toolCalls,
-			}
-
 			// Send the complete message back to be added to context
 			m.streamChan <- streamDoneMsg{
-				fullContent:  content,
-				assistantMsg: assistantMsg,
+				fullContent: fullContent.String(),
+				toolCalls:   toolCalls,
 			}
 		}()
 
@@ -625,14 +602,13 @@ func (m model) sendMessage() tea.Cmd {
 }
 
 // executeTools runs the requested tool calls and returns their results
-func (m model) executeTools(toolCalls []api.ToolCall) tea.Cmd {
+func (m model) executeTools(toolCalls []backend.ToolCall) tea.Cmd {
 	return func() tea.Msg {
-		var results []api.Message
+		var results []backend.Message
 
 		for _, toolCall := range toolCalls {
-			// Get arguments as map
-			args := toolCall.Function.Arguments.ToMap()
-			toolName := toolCall.Function.Name
+			args := toolCall.Arguments
+			toolName := toolCall.Name
 
 			// Log tool execution for debugging
 			toolInfo := fmt.Sprintf("Executing tool: %s with args: %v", toolName, args)
@@ -650,7 +626,7 @@ func (m model) executeTools(toolCalls []api.ToolCall) tea.Cmd {
 
 			if err != nil {
 				// Create tool response message with error
-				results = append(results, api.Message{
+				results = append(results, backend.Message{
 					Role:       "tool",
 					Content:    fmt.Sprintf("Error executing %s: %v\nDebug: %s", toolName, err, toolInfo),
 					ToolCallID: toolCall.ID, // Link back to the tool call
@@ -659,7 +635,7 @@ func (m model) executeTools(toolCalls []api.ToolCall) tea.Cmd {
 			}
 
 			// Add successful result with tool call ID
-			results = append(results, api.Message{
+			results = append(results, backend.Message{
 				Role:       "tool",
 				Content:    result,
 				ToolCallID: toolCall.ID, // Link back to the tool call
@@ -683,8 +659,8 @@ func waitForStreamChunk(msgChan <-chan tea.Msg) tea.Cmd {
 
 // parseJSONToolCalls extracts tool calls from JSON in the response text
 // Looks for patterns like: {"name": "tool_name", "parameters": {...}}
-func parseJSONToolCalls(content string) []api.ToolCall {
-	var toolCalls []api.ToolCall
+func parseJSONToolCalls(content string) []backend.ToolCall {
+	var toolCalls []backend.ToolCall
 
 	// Pattern to match JSON objects with "name" and "parameters" fields
 	// This matches: {"name": "...", "parameters": {...}}
@@ -706,28 +682,48 @@ func parseJSONToolCalls(content string) []api.ToolCall {
 			continue
 		}
 
-		// Convert params to ToolCallFunctionArguments
-		argsJSON, err := json.Marshal(params)
-		if err != nil {
-			continue
-		}
-
-		var args api.ToolCallFunctionArguments
-		if err := json.Unmarshal(argsJSON, &args); err != nil {
-			continue
-		}
-
 		// Create a ToolCall
-		toolCall := api.ToolCall{
-			ID: fmt.Sprintf("manual_call_%d", i),
-			Function: api.ToolCallFunction{
-				Name:      toolName,
-				Arguments: args,
-			},
+		toolCall := backend.ToolCall{
+			ID:        fmt.Sprintf("manual_call_%d", i),
+			Name:      toolName,
+			Arguments: params,
 		}
 
 		toolCalls = append(toolCalls, toolCall)
 	}
 
 	return toolCalls
+}
+
+
+// convertBuiltInTools converts Ollama api.Tools to []backend.Tool
+func convertBuiltInTools() []backend.Tool {
+	ollamaTools := defineTools()
+	tools := make([]backend.Tool, len(ollamaTools))
+
+	for i, t := range ollamaTools {
+		// Convert properties to map for JSON schema
+		props := make(map[string]interface{})
+		if t.Function.Parameters.Properties != nil {
+			propsMap := t.Function.Parameters.Properties.ToMap()
+			for k, v := range propsMap {
+				props[k] = map[string]interface{}{
+					"type":        v.Type,
+					"description": v.Description,
+				}
+			}
+		}
+
+		tools[i] = backend.Tool{
+			Name:        t.Function.Name,
+			Description: t.Function.Description,
+			Parameters: map[string]interface{}{
+				"type":       t.Function.Parameters.Type,
+				"properties": props,
+				"required":   t.Function.Parameters.Required,
+			},
+		}
+	}
+
+	return tools
 }

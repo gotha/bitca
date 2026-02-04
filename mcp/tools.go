@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 
+	"github.com/gotha/bitca/backend"
 	"github.com/ollama/ollama/api"
 )
 
@@ -89,6 +90,24 @@ func (m *Manager) GetOllamaTools() api.Tools {
 	for _, client := range m.clients {
 		for _, mcpTool := range client.Tools() {
 			tool := convertMCPToolToOllama(mcpTool)
+			tools = append(tools, tool)
+		}
+	}
+
+	return tools
+}
+
+// GetBackendTools converts all MCP tools to backend.Tool format
+func (m *Manager) GetBackendTools() []backend.Tool {
+	var tools []backend.Tool
+
+	for _, client := range m.clients {
+		for _, mcpTool := range client.Tools() {
+			tool := backend.Tool{
+				Name:        mcpTool.Name,
+				Description: mcpTool.Description,
+				Parameters:  mcpTool.InputSchema,
+			}
 			tools = append(tools, tool)
 		}
 	}
